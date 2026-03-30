@@ -1,0 +1,131 @@
+From d638442955656110fbe6cc0d8804de0caccda17d Mon Sep 17 00:00:00 2001
+From: constansino <louishino0524@gmail.com>
+Date: Tue, 31 Mar 2026 00:31:16 +0800
+Subject: [PATCH] Default stream retries to fixed 1s backoff
+
+---
+ codex-rs/core/config.schema.json               |  5 +++--
+ codex-rs/core/src/model_provider_info.rs       |  8 ++++----
+ codex-rs/core/src/model_provider_info_tests.rs | 18 +++++++++++++++---
+ 3 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 36a3b83b5..7fbe04dec 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -884,10 +884,11 @@
+               "$ref": "#/definitions/StreamRetryBackoff"
+             }
+           ],
+-          "default": "exponential",
++          "default": "fixed",
+           "description": "How the delay between stream reconnection attempts should evolve over time."
+         },
+         "stream_retry_delay_ms": {
++          "default": 1000,
+           "description": "Base delay (in milliseconds) between stream reconnection attempts.",
+           "format": "uint64",
+           "minimum": 0.0,
+@@ -1843,7 +1844,7 @@
+       "type": "object"
+     },
+     "StreamRetryBackoff": {
+-      "default": "exponential",
++      "default": "fixed",
+       "enum": [
+         "exponential",
+         "fixed"
+diff --git a/codex-rs/core/src/model_provider_info.rs b/codex-rs/core/src/model_provider_info.rs
+index 116fffcca..cf73ea329 100644
+--- a/codex-rs/core/src/model_provider_info.rs
++++ b/codex-rs/core/src/model_provider_info.rs
+@@ -20,7 +20,7 @@ use std::fmt;
+ use std::time::Duration;
+ 
+ const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+-const DEFAULT_STREAM_RETRY_DELAY_MS: u64 = 200;
++const DEFAULT_STREAM_RETRY_DELAY_MS: u64 = 1_000;
+ const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
+ const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
+ pub(crate) const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
+@@ -71,8 +71,8 @@ impl<'de> Deserialize<'de> for WireApi {
+ #[serde(rename_all = "lowercase")]
+ pub enum StreamRetryBackoff {
+     #[default]
+-    Exponential,
+     Fixed,
++    Exponential,
+ }
+ 
+ /// Serializable representation of a provider definition.
+@@ -296,7 +296,7 @@ impl ModelProviderInfo {
+             request_max_retries: None,
+             stream_max_retries: None,
+             stream_retry_delay_ms: None,
+-            stream_retry_backoff: StreamRetryBackoff::Exponential,
++            stream_retry_backoff: StreamRetryBackoff::Fixed,
+             stream_idle_timeout_ms: None,
+             websocket_connect_timeout_ms: None,
+             requires_openai_auth: true,
+@@ -375,7 +375,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
+         request_max_retries: None,
+         stream_max_retries: None,
+         stream_retry_delay_ms: None,
+-        stream_retry_backoff: StreamRetryBackoff::Exponential,
++        stream_retry_backoff: StreamRetryBackoff::Fixed,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/src/model_provider_info_tests.rs b/codex-rs/core/src/model_provider_info_tests.rs
+index 72ab5d93d..90863efc6 100644
+--- a/codex-rs/core/src/model_provider_info_tests.rs
++++ b/codex-rs/core/src/model_provider_info_tests.rs
+@@ -21,7 +21,7 @@ base_url = "http://localhost:11434/v1"
+         request_max_retries: None,
+         stream_max_retries: None,
+         stream_retry_delay_ms: None,
+-        stream_retry_backoff: StreamRetryBackoff::Exponential,
++        stream_retry_backoff: StreamRetryBackoff::Fixed,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -55,7 +55,7 @@ query_params = { api-version = "2025-04-01-preview" }
+         request_max_retries: None,
+         stream_max_retries: None,
+         stream_retry_delay_ms: None,
+-        stream_retry_backoff: StreamRetryBackoff::Exponential,
++        stream_retry_backoff: StreamRetryBackoff::Fixed,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -92,7 +92,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+         request_max_retries: None,
+         stream_max_retries: None,
+         stream_retry_delay_ms: None,
+-        stream_retry_backoff: StreamRetryBackoff::Exponential,
++        stream_retry_backoff: StreamRetryBackoff::Fixed,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -143,6 +143,18 @@ stream_retry_backoff = "fixed"
+     assert_eq!(provider.stream_retry_backoff, StreamRetryBackoff::Fixed);
+ }
+ 
++#[test]
++fn test_default_stream_retry_behavior_is_fixed_one_second() {
++    let provider_toml = r#"
++name = "OpenAI"
++base_url = "https://api.openai.com/v1"
++        "#;
++
++    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
++    assert_eq!(provider.stream_retry_delay(1), Duration::from_secs(1));
++    assert_eq!(provider.stream_retry_delay(10), Duration::from_secs(1));
++}
++
+ #[test]
+ fn test_stream_retry_delay_fixed_returns_exact_base_delay() {
+     let provider = ModelProviderInfo {
+-- 
+2.51.0.windows.2
+

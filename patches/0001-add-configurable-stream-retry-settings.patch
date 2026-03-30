@@ -1,0 +1,487 @@
+From 26f1f1464cfdced4a6914629887713129577efc0 Mon Sep 17 00:00:00 2001
+From: constansino <louishino0524@gmail.com>
+Date: Sun, 29 Mar 2026 17:15:49 +0800
+Subject: [PATCH] Add configurable stream retry delay/backoff settings
+
+---
+ codex-rs/core/config.schema.json              | 25 ++++++-
+ codex-rs/core/src/auth_env_telemetry.rs       |  2 +
+ codex-rs/core/src/codex.rs                    |  8 +-
+ codex-rs/core/src/compact.rs                  |  3 +-
+ codex-rs/core/src/config/config_tests.rs      |  4 +
+ codex-rs/core/src/lib.rs                      |  1 +
+ codex-rs/core/src/model_provider_info.rs      | 32 ++++++++
+ .../core/src/model_provider_info_tests.rs     | 74 +++++++++++++++++++
+ .../core/src/models_manager/manager_tests.rs  |  2 +
+ codex-rs/core/src/util.rs                     |  6 +-
+ codex-rs/core/tests/responses_headers.rs      |  6 ++
+ codex-rs/core/tests/suite/client.rs           |  6 ++
+ .../core/tests/suite/client_websockets.rs     |  2 +
+ .../suite/stream_error_allows_next_turn.rs    |  2 +
+ .../core/tests/suite/stream_no_completed.rs   |  2 +
+ 15 files changed, 166 insertions(+), 9 deletions(-)
+
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index e36f495a1..36a3b83b5 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -878,6 +878,21 @@
+           "minimum": 0.0,
+           "type": "integer"
+         },
++        "stream_retry_backoff": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/StreamRetryBackoff"
++            }
++          ],
++          "default": "exponential",
++          "description": "How the delay between stream reconnection attempts should evolve over time."
++        },
++        "stream_retry_delay_ms": {
++          "description": "Base delay (in milliseconds) between stream reconnection attempts.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
+         "stream_max_retries": {
+           "description": "Number of times to retry reconnecting a dropped streaming response before failing.",
+           "format": "uint64",
+@@ -1827,6 +1842,14 @@
+       },
+       "type": "object"
+     },
++    "StreamRetryBackoff": {
++      "default": "exponential",
++      "enum": [
++        "exponential",
++        "fixed"
++      ],
++      "type": "string"
++    },
+     "WireApi": {
+       "description": "Wire protocol that the provider speaks.",
+       "oneOf": [
+@@ -2568,4 +2591,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+diff --git a/codex-rs/core/src/auth_env_telemetry.rs b/codex-rs/core/src/auth_env_telemetry.rs
+index cc5ffa120..e177626a3 100644
+--- a/codex-rs/core/src/auth_env_telemetry.rs
++++ b/codex-rs/core/src/auth_env_telemetry.rs
+@@ -70,6 +70,8 @@ mod tests {
+             env_http_headers: None,
+             request_max_retries: None,
+             stream_max_retries: None,
++            stream_retry_delay_ms: None,
++            stream_retry_backoff: crate::model_provider_info::StreamRetryBackoff::Exponential,
+             stream_idle_timeout_ms: None,
+             websocket_connect_timeout_ms: None,
+             requires_openai_auth: false,
+diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
+index 4dca8dc68..f266130f9 100644
+--- a/codex-rs/core/src/codex.rs
++++ b/codex-rs/core/src/codex.rs
+@@ -348,7 +348,6 @@ use crate::turn_timing::TurnTimingState;
+ use crate::turn_timing::record_turn_ttfm_metric;
+ use crate::turn_timing::record_turn_ttft_metric;
+ use crate::unified_exec::UnifiedExecProcessManager;
+-use crate::util::backoff;
+ use crate::windows_sandbox::WindowsSandboxLevelExt;
+ use codex_async_utils::OrCancelExt;
+ use codex_git_utils::get_git_repo_root;
+@@ -6427,10 +6426,9 @@ async fn run_sampling_request(
+         if retries < max_retries {
+             retries += 1;
+             let delay = match &err {
+-                CodexErr::Stream(_, requested_delay) => {
+-                    requested_delay.unwrap_or_else(|| backoff(retries))
+-                }
+-                _ => backoff(retries),
++                CodexErr::Stream(_, requested_delay) => requested_delay
++                    .unwrap_or_else(|| turn_context.provider.stream_retry_delay(retries)),
++                _ => turn_context.provider.stream_retry_delay(retries),
+             };
+             warn!(
+                 "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 82fd5c15e..d1ff11f28 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -15,7 +15,6 @@ use crate::protocol::CompactedItem;
+ use crate::protocol::EventMsg;
+ use crate::protocol::TurnStartedEvent;
+ use crate::protocol::WarningEvent;
+-use crate::util::backoff;
+ use codex_protocol::items::ContextCompactionItem;
+ use codex_protocol::items::TurnItem;
+ use codex_protocol::models::ContentItem;
+@@ -170,7 +169,7 @@ async fn run_compact_task_inner(
+             Err(e) => {
+                 if retries < max_retries {
+                     retries += 1;
+-                    let delay = backoff(retries);
++                    let delay = turn_context.provider.stream_retry_delay(retries);
+                     sess.notify_stream_error(
+                         turn_context.as_ref(),
+                         format!("Reconnecting... {retries}/{max_retries}"),
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 00227fe2b..8e130ccbb 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -4265,6 +4265,8 @@ env_key = "OPENAI_API_KEY"
+ wire_api = "responses"
+ request_max_retries = 4            # retry failed HTTP requests
+ stream_max_retries = 10            # retry dropped SSE streams
++stream_retry_delay_ms = 500        # 500ms between reconnect attempts
++stream_retry_backoff = "fixed"     # keep retry delay constant
+ stream_idle_timeout_ms = 300000    # 5m idle timeout
+ websocket_connect_timeout_ms = 15000
+ 
+@@ -4320,6 +4322,8 @@ model_verbosity = "high"
+         env_http_headers: None,
+         request_max_retries: Some(4),
+         stream_max_retries: Some(10),
++        stream_retry_delay_ms: Some(500),
++        stream_retry_backoff: crate::model_provider_info::StreamRetryBackoff::Fixed,
+         stream_idle_timeout_ms: Some(300_000),
+         websocket_connect_timeout_ms: Some(15_000),
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 5276b09de..aeb51ebcf 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -110,6 +110,7 @@ pub use model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+ pub use model_provider_info::ModelProviderInfo;
+ pub use model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+ pub use model_provider_info::OPENAI_PROVIDER_ID;
++pub use model_provider_info::StreamRetryBackoff;
+ pub use model_provider_info::WireApi;
+ pub use model_provider_info::built_in_model_providers;
+ pub use model_provider_info::create_oss_provider_with_base_url;
+diff --git a/codex-rs/core/src/model_provider_info.rs b/codex-rs/core/src/model_provider_info.rs
+index 737a47780..116fffcca 100644
+--- a/codex-rs/core/src/model_provider_info.rs
++++ b/codex-rs/core/src/model_provider_info.rs
+@@ -20,6 +20,7 @@ use std::fmt;
+ use std::time::Duration;
+ 
+ const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
++const DEFAULT_STREAM_RETRY_DELAY_MS: u64 = 200;
+ const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
+ const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
+ pub(crate) const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
+@@ -66,6 +67,14 @@ impl<'de> Deserialize<'de> for WireApi {
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
++#[serde(rename_all = "lowercase")]
++pub enum StreamRetryBackoff {
++    #[default]
++    Exponential,
++    Fixed,
++}
++
+ /// Serializable representation of a provider definition.
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+@@ -109,6 +118,13 @@ pub struct ModelProviderInfo {
+     /// Number of times to retry reconnecting a dropped streaming response before failing.
+     pub stream_max_retries: Option<u64>,
+ 
++    /// Base delay (in milliseconds) between stream reconnection attempts.
++    pub stream_retry_delay_ms: Option<u64>,
++
++    /// How the delay between stream reconnection attempts should evolve over time.
++    #[serde(default)]
++    pub stream_retry_backoff: StreamRetryBackoff,
++
+     /// Idle timeout (in milliseconds) to wait for activity on a streaming response before treating
+     /// the connection as lost.
+     pub stream_idle_timeout_ms: Option<u64>,
+@@ -225,6 +241,18 @@ impl ModelProviderInfo {
+             .min(MAX_STREAM_MAX_RETRIES)
+     }
+ 
++    /// Effective delay to wait before the next stream reconnection attempt.
++    pub fn stream_retry_delay(&self, attempt: u64) -> Duration {
++        let base_delay = self
++            .stream_retry_delay_ms
++            .map(Duration::from_millis)
++            .unwrap_or(Duration::from_millis(DEFAULT_STREAM_RETRY_DELAY_MS));
++        match self.stream_retry_backoff {
++            StreamRetryBackoff::Exponential => crate::util::backoff_with_base(base_delay, attempt),
++            StreamRetryBackoff::Fixed => base_delay,
++        }
++    }
++
+     /// Effective idle timeout for streaming responses.
+     pub fn stream_idle_timeout(&self) -> Duration {
+         self.stream_idle_timeout_ms
+@@ -267,6 +295,8 @@ impl ModelProviderInfo {
+             // Use global defaults for retry/timeout unless overridden in config.toml.
+             request_max_retries: None,
+             stream_max_retries: None,
++            stream_retry_delay_ms: None,
++            stream_retry_backoff: StreamRetryBackoff::Exponential,
+             stream_idle_timeout_ms: None,
+             websocket_connect_timeout_ms: None,
+             requires_openai_auth: true,
+@@ -344,6 +374,8 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
+         env_http_headers: None,
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/src/model_provider_info_tests.rs b/codex-rs/core/src/model_provider_info_tests.rs
+index a5309117a..72ab5d93d 100644
+--- a/codex-rs/core/src/model_provider_info_tests.rs
++++ b/codex-rs/core/src/model_provider_info_tests.rs
+@@ -1,5 +1,6 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
++use std::time::Duration;
+ 
+ #[test]
+ fn test_deserialize_ollama_model_provider_toml() {
+@@ -19,6 +20,8 @@ base_url = "http://localhost:11434/v1"
+         env_http_headers: None,
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -51,6 +54,8 @@ query_params = { api-version = "2025-04-01-preview" }
+         env_http_headers: None,
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -86,6 +91,8 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+         }),
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -121,3 +128,70 @@ supports_websockets = true
+     let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+     assert_eq!(provider.websocket_connect_timeout_ms, Some(15_000));
+ }
++
++#[test]
++fn test_deserialize_stream_retry_backoff_config() {
++    let provider_toml = r#"
++name = "OpenAI"
++base_url = "https://api.openai.com/v1"
++stream_retry_delay_ms = 500
++stream_retry_backoff = "fixed"
++        "#;
++
++    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
++    assert_eq!(provider.stream_retry_delay_ms, Some(500));
++    assert_eq!(provider.stream_retry_backoff, StreamRetryBackoff::Fixed);
++}
++
++#[test]
++fn test_stream_retry_delay_fixed_returns_exact_base_delay() {
++    let provider = ModelProviderInfo {
++        name: "Fixed".into(),
++        base_url: None,
++        env_key: None,
++        env_key_instructions: None,
++        experimental_bearer_token: None,
++        wire_api: WireApi::Responses,
++        query_params: None,
++        http_headers: None,
++        env_http_headers: None,
++        request_max_retries: None,
++        stream_max_retries: None,
++        stream_retry_delay_ms: Some(500),
++        stream_retry_backoff: StreamRetryBackoff::Fixed,
++        stream_idle_timeout_ms: None,
++        websocket_connect_timeout_ms: None,
++        requires_openai_auth: false,
++        supports_websockets: false,
++    };
++
++    assert_eq!(provider.stream_retry_delay(1), Duration::from_millis(500));
++    assert_eq!(provider.stream_retry_delay(10), Duration::from_millis(500));
++}
++
++#[test]
++fn test_stream_retry_delay_exponential_uses_configured_base_delay() {
++    let provider = ModelProviderInfo {
++        name: "Exponential".into(),
++        base_url: None,
++        env_key: None,
++        env_key_instructions: None,
++        experimental_bearer_token: None,
++        wire_api: WireApi::Responses,
++        query_params: None,
++        http_headers: None,
++        env_http_headers: None,
++        request_max_retries: None,
++        stream_max_retries: None,
++        stream_retry_delay_ms: Some(500),
++        stream_retry_backoff: StreamRetryBackoff::Exponential,
++        stream_idle_timeout_ms: None,
++        websocket_connect_timeout_ms: None,
++        requires_openai_auth: false,
++        supports_websockets: false,
++    };
++
++    let delay = provider.stream_retry_delay(3);
++    assert!(delay >= Duration::from_millis(1_800));
++    assert!(delay <= Duration::from_millis(2_200));
++}
+diff --git a/codex-rs/core/src/models_manager/manager_tests.rs b/codex-rs/core/src/models_manager/manager_tests.rs
+index 7b4b2be53..26109bb23 100644
+--- a/codex-rs/core/src/models_manager/manager_tests.rs
++++ b/codex-rs/core/src/models_manager/manager_tests.rs
+@@ -85,6 +85,8 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: crate::model_provider_info::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/src/util.rs b/codex-rs/core/src/util.rs
+index 04d973c86..1fdce7d0b 100644
+--- a/codex-rs/core/src/util.rs
++++ b/codex-rs/core/src/util.rs
+@@ -202,8 +202,12 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
+ }
+ 
+ pub fn backoff(attempt: u64) -> Duration {
++    backoff_with_base(Duration::from_millis(INITIAL_DELAY_MS), attempt)
++}
++
++pub fn backoff_with_base(base_delay: Duration, attempt: u64) -> Duration {
+     let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
+-    let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
++    let base = (base_delay.as_millis() as f64 * exp) as u64;
+     let jitter = rand::rng().random_range(0.9..1.1);
+     Duration::from_millis((base as f64 * jitter) as u64)
+ }
+diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
+index 515d07f20..1aba3e4d4 100644
+--- a/codex-rs/core/tests/responses_headers.rs
++++ b/codex-rs/core/tests/responses_headers.rs
+@@ -52,6 +52,8 @@ async fn responses_stream_includes_subagent_header_on_review() {
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -164,6 +166,8 @@ async fn responses_stream_includes_subagent_header_on_other() {
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -271,6 +275,8 @@ async fn responses_respects_model_info_overrides_from_config() {
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 9be02cf97..bc00628ad 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -1802,6 +1802,8 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -2409,6 +2411,8 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
+         env_http_headers: None,
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+@@ -2494,6 +2498,8 @@ async fn env_var_overrides_loaded_auth() {
+         env_http_headers: None,
+         request_max_retries: None,
+         stream_max_retries: None,
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: None,
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 1f94330cb..3df75ef08 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -1680,6 +1680,8 @@ fn websocket_provider_with_connect_timeout(
+         env_http_headers: None,
+         request_max_retries: Some(0),
+         stream_max_retries: Some(0),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(5_000),
+         websocket_connect_timeout_ms,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+index 23ffc4afb..b97c0d4ce 100644
+--- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
++++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+@@ -75,6 +75,8 @@ async fn continue_after_stream_error() {
+         env_http_headers: None,
+         request_max_retries: Some(1),
+         stream_max_retries: Some(1),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(2_000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
+index 5d1b21481..62215d475 100644
+--- a/codex-rs/core/tests/suite/stream_no_completed.rs
++++ b/codex-rs/core/tests/suite/stream_no_completed.rs
+@@ -60,6 +60,8 @@ async fn retries_on_early_close() {
+         // exercise retry path: first attempt yields incomplete stream, so allow 1 retry
+         request_max_retries: Some(0),
+         stream_max_retries: Some(1),
++        stream_retry_delay_ms: None,
++        stream_retry_backoff: codex_core::StreamRetryBackoff::Exponential,
+         stream_idle_timeout_ms: Some(2000),
+         websocket_connect_timeout_ms: None,
+         requires_openai_auth: false,
+-- 
+2.51.0.windows.2
+

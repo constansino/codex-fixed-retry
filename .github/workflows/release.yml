@@ -1,0 +1,188 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream openai/codex tag, branch, or commit to patch
+        required: true
+        default: main
+      release_tag:
+        description: Optional GitHub release tag for this patched build
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      upstream_ref: ${{ steps.meta.outputs.upstream_ref }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_ref='${{ inputs.upstream_ref }}'
+          release_tag='${{ inputs.release_tag }}'
+          if [[ -z "${release_tag}" ]]; then
+            sanitized="$(printf '%s' "${upstream_ref}" | tr '/:@ ' '----' | tr -cd '[:alnum:]._-' )"
+            release_tag="patched-${sanitized}"
+          fi
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_name=Codex Fixed Retry ${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=${upstream_ref}" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Clone upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/openai/codex.git upstream
+          git -C upstream checkout '${{ needs.prepare.outputs.upstream_ref }}'
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C upstream am \
+            "$GITHUB_WORKSPACE/patches/0001-add-configurable-stream-retry-settings.patch" \
+            "$GITHUB_WORKSPACE/patches/0002-default-stream-retries-to-fixed-1s.patch"
+
+      - name: Build codex
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --manifest-path upstream/codex-rs/Cargo.toml \
+            --release \
+            --target '${{ matrix.target }}' \
+            --bin codex
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binary="upstream/codex-rs/target/${{ matrix.target }}/release/codex"
+          tar -C "$(dirname "$binary")" -czf "dist/codex-fixed-retry-${{ matrix.target }}.tar.gz" codex
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/*
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Clone upstream
+        shell: pwsh
+        run: |
+          git clone https://github.com/openai/codex.git upstream
+          git -C upstream checkout '${{ needs.prepare.outputs.upstream_ref }}'
+
+      - name: Apply patches
+        shell: pwsh
+        run: |
+          $patch1 = Join-Path $env:GITHUB_WORKSPACE 'patches\0001-add-configurable-stream-retry-settings.patch'
+          $patch2 = Join-Path $env:GITHUB_WORKSPACE 'patches\0002-default-stream-retries-to-fixed-1s.patch'
+          & git -C upstream am $patch1 $patch2
+          if ($LASTEXITCODE -ne 0) {
+              throw "git am failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build codex bundle
+        shell: pwsh
+        run: |
+          cargo build `
+            --manifest-path upstream/codex-rs/Cargo.toml `
+            --release `
+            --target x86_64-pc-windows-msvc `
+            --bin codex `
+            --bin codex-responses-api-proxy `
+            --bin codex-windows-sandbox-setup `
+            --bin codex-command-runner
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'upstream\codex-rs\target\x86_64-pc-windows-msvc\release'
+          $stageDir = Join-Path $env:RUNNER_TEMP 'codex-fixed-retry'
+          $distDir = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $stageDir, $distDir | Out-Null
+
+          Copy-Item (Join-Path $releaseDir 'codex.exe') $stageDir
+          Copy-Item (Join-Path $releaseDir 'codex-responses-api-proxy.exe') $stageDir
+          Copy-Item (Join-Path $releaseDir 'codex-windows-sandbox-setup.exe') $stageDir
+          Copy-Item (Join-Path $releaseDir 'codex-command-runner.exe') $stageDir
+
+          $zipPath = Join-Path $distDir 'codex-fixed-retry-x86_64-pc-windows-msvc.zip'
+          if (Test-Path -LiteralPath $zipPath) {
+              Remove-Item -LiteralPath $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-pc-windows-msvc
+          path: dist/*
+
+  release:
+    needs:
+      - prepare
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          find dist -maxdepth 2 -type f -exec cp {} release-dist/ \;
+          ls -lah release-dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          prerelease: true
+          files: release-dist/*
+          body: |
+            Patched build of `openai/codex` at `${{ needs.prepare.outputs.upstream_ref }}`.
+
+            Included patch set:
+            - configurable stream retry delay/backoff in TOML
+            - default stream retry policy changed to fixed 1 second
