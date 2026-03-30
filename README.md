@@ -51,9 +51,8 @@ Use your own provider id instead of `openai` if you are routing through a custom
   Downloads the latest patched macOS release asset from this repo and installs a user-local `codex` shim.
 - `scripts/install.ps1`
   Downloads the latest patched Windows release asset from this repo and installs user-local `codex.cmd` / `codex.ps1` shims.
-- `workflow/release.yml.example`
-  GitHub Actions workflow template that clones upstream `openai/codex`, applies both patches, builds release binaries, and publishes GitHub release assets.
-  It is stored outside `.github/workflows/` because the current GitHub token does not have `workflow` scope, so GitHub refused a direct push to `.github/workflows/`.
+- `.github/workflows/release.yml`
+  GitHub Actions workflow that clones upstream `openai/codex`, applies both patches, builds release binaries, and publishes GitHub release assets.
 
 ## Install Patched Codex
 
@@ -95,22 +94,6 @@ The workflow will:
 3. apply both patches
 4. build macOS and Windows binaries
 5. publish GitHub release assets from this repo
-
-## Enable GitHub Actions
-
-Because the current GitHub token only has `repo` scope, GitHub rejected pushes that write directly into `.github/workflows/`.
-
-The workflow file is still included in this repo as:
-
-```text
-workflow/release.yml.example
-```
-
-To enable it later:
-
-1. grant a token with `workflow` scope, or refresh `gh auth` with that scope
-2. move `workflow/release.yml.example` to `.github/workflows/release.yml`
-3. commit and push
 
 ## Apply Patches To A Local Upstream Checkout
 
